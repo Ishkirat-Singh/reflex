@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 import pytest_asyncio
+from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
@@ -259,8 +260,13 @@ async def state_manager(
     Yields:
         A state manager instance
     """
-    state_manager = StateManager.create()
     if request.param == "redis":
+        # Only construct the configured manager for the redis param. When
+        # REFLEX_REDIS_URL is set, `StateManager.create()` returns a live
+        # StateManagerRedis that starts a `_lock_task`, so building one for the
+        # other params would orphan that task: it is replaced below and never
+        # closed, and then blocks event-loop teardown.
+        state_manager = StateManager.create()
         if not isinstance(state_manager, StateManagerRedis):
             state_manager = StateManagerRedis(redis=mock_redis())
     elif request.param == "disk":
@@ -570,6 +576,15 @@ def otel_metrics(otel_sdk) -> InMemoryMetricReader:
         The metric reader.
     """
     return otel_sdk[1]
+
+
+def active_tracer() -> trace.Tracer:
+    """The tracer bound by the enabled otel_sdk fixture.
+
+    Returns:
+        The tracer.
+    """
+    return otel._tracer
 
 
 def metric_points(reader: InMemoryMetricReader, name: str) -> list:
