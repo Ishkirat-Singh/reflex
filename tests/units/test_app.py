@@ -20,6 +20,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import reflex_base
 from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pytest_mock import MockerFixture
 from reflex_base import otel
 from reflex_base.components.component import Component
@@ -37,6 +40,7 @@ from reflex_components_core.base.bare import Bare
 from reflex_components_core.base.fragment import Fragment
 from reflex_components_core.core.upload import selected_files
 from reflex_components_radix.themes.typography.text import Text
+from reflex_otel import ReflexInstrumentor
 from starlette.applications import Starlette
 from starlette.datastructures import FormData, Headers, UploadFile
 from starlette.requests import ClientDisconnect
@@ -4415,6 +4419,107 @@ async def test_on_event_uses_frontend_traceparent(otel_exporter):
     remote, fresh = seen
     assert f"{remote.trace_id:032x}" == "0af7651916cd43dd8448eb211c80319c"
     assert not fresh.is_valid
+
+
+@pytest.mark.asyncio
+async def test_upload_handler_span_joins_the_request_trace(
+    tmp_path: Path,
+    token: str,
+    attached_mock_base_state_event_processor: BaseStateEventProcessor,
+    mock_root_event_context: EventContext,
+    clean_registration_context: RegistrationContext,
+):
+    """A buffered upload's handler span continues the trace of the request that carried it.
+
+    The endpoint answers with a streaming response whose body runs in its own
+    task; the handler it enqueues from there must still nest under the request
+    span, which itself continues the browser's traceparent header.
+
+    Args:
+        tmp_path: Temporary path.
+        token: a Token.
+        attached_mock_base_state_event_processor: BaseStateEventProcessor Fixture attached to the app instance to capture emitted events.
+        mock_root_event_context: The mocked root event context, for accessing state_manager.
+        clean_registration_context: Fixture to ensure clean registration context for each test, preventing cross-test contamination of state subclasses.
+    """
+    state = FileUploadState
+    handler_name = f"{state.get_full_name()}.multi_handle_upload"
+    clean_registration_context.register_base_state(state)
+    app = Mock(event_processor=attached_mock_base_state_event_processor)
+    async with mock_root_event_context.state_manager.modify_state(
+        BaseStateToken(ident=token, cls=state)
+    ) as root_state:
+        (await root_state.get_state(state))._tmp_path = tmp_path
+    request_mock = unittest.mock.Mock()
+    request_mock.headers = {
+        "reflex-client-token": token,
+        "reflex-event-handler": handler_name,
+    }
+
+    async def form():  # noqa: RUF029
+        return FormData([
+            ("files", UploadFile(filename="image1.jpg", file=io.BytesIO(b"data")))
+        ])
+
+    request_mock.form = form
+    upload_fn = upload(app)
+
+    async def asgi_app(scope, receive, send):
+        response = await upload_fn(request_mock)
+        await response(scope, receive, send)
+
+    finished = asyncio.Event()
+
+    async def receive():
+        # The disconnect watcher only hears from the client once the body is sent.
+        await finished.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):  # noqa: RUF029
+        if message["type"] == "http.response.body" and not message.get("more_body"):
+            finished.set()
+
+    traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/_upload",
+        "raw_path": b"/_upload",
+        "query_string": b"",
+        "headers": [(b"traceparent", traceparent.encode())],
+        "scheme": "http",
+        "server": ("localhost", 80),
+        "http_version": "1.1",
+    }
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    instrumentor = ReflexInstrumentor()
+    instrumentor.instrument(tracer_provider=provider)
+    try:
+        assert otel.asgi_middleware is not None
+        await otel.asgi_middleware(asgi_app)(scope, receive, send)
+    finally:
+        instrumentor.uninstrument()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    (request_span,) = [
+        span for span in spans.values() if span.kind is trace.SpanKind.SERVER
+    ]
+    handler_span = spans[handler_name]
+    request_context = request_span.get_span_context()
+    request_parent = request_span.parent
+    handler_context = handler_span.get_span_context()
+    handler_parent = handler_span.parent
+    assert request_context is not None
+    assert request_parent is not None
+    assert handler_context is not None
+    assert handler_parent is not None
+    # The request span continues the header's trace; the handler nests under it.
+    assert request_parent.is_remote
+    assert f"{request_parent.span_id:016x}" == "b7ad6b7169203331"
+    assert f"{handler_context.trace_id:032x}" == "0af7651916cd43dd8448eb211c80319c"
+    assert handler_parent.span_id == request_context.span_id
 
 
 @pytest.mark.asyncio
