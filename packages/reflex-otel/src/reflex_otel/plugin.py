@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,33 +29,23 @@ FRONTEND_DEPENDENCIES = (
 )
 
 _ENTRY_IMPORT = 'import { OtelRoot } from "$/utils/otel";\n'
-_ENTRY_ROOT_ANCHOR = "createElement(HydratedRouter)"
-_ENTRY_ROOT_WRAPPED = "createElement(OtelRoot, null, createElement(HydratedRouter))"
+# React roots rendered by the entry: the hydrated document root, and the
+# embed entry's client-rendered root. Each is wrapped in the profiling root.
+_ENTRY_ROOT_ANCHORS = (
+    "createElement(HydratedRouter)",
+    "createElement(RouterProvider, { router })",
+)
 
 # React strips <Profiler> from production builds; the profiling build keeps it.
 # The alias is appended to the existing `resolve.alias` array of the generated
-# config: a second `resolve` key would silently override the first one.
-_VITE_CONFIG_ANCHOR = (
-    '  resolve: {\n    mainFields: ["browser", "module", "jsnext"],\n    alias: [\n'
+# config: a second `resolve` key would silently override the first one. The
+# anchor tolerates whitespace changes in the template.
+_VITE_CONFIG_ANCHOR = re.compile(
+    r"resolve:\s*\{\s*mainFields:\s*\[[^\]]*\],\s*alias:\s*\[[ \t]*\n"
 )
 _VITE_PROFILING_ALIAS = (
     '      { find: "react-dom/client", replacement: "react-dom/profiling" },\n'
 )
-
-
-def _default_endpoint() -> str:
-    """Resolve the OTLP/HTTP traces URL the browser exports to.
-
-    Mirrors the SDK environment variables so one configuration covers both
-    the backend exporter and the browser.
-
-    Returns:
-        The traces endpoint URL.
-    """
-    if traces := os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"):
-        return traces
-    base = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
-    return base.rstrip("/") + "/v1/traces"
 
 
 def _patch_entry_client(content: str) -> str:
@@ -69,13 +59,14 @@ def _patch_entry_client(content: str) -> str:
     """
     if _ENTRY_IMPORT in content:
         return content
-    if _ENTRY_ROOT_ANCHOR not in content:
+    if not any(anchor in content for anchor in _ENTRY_ROOT_ANCHORS):
         logger.warning(
-            "OtelPlugin: %r not found in %s; React render timing is disabled.",
-            _ENTRY_ROOT_ANCHOR,
+            "OtelPlugin: no React root found in %s; render timing is disabled.",
             Embed.ENTRY_PATH,
         )
-    return _ENTRY_IMPORT + content.replace(_ENTRY_ROOT_ANCHOR, _ENTRY_ROOT_WRAPPED, 1)
+    for anchor in _ENTRY_ROOT_ANCHORS:
+        content = content.replace(anchor, f"createElement(OtelRoot, null, {anchor})", 1)
+    return _ENTRY_IMPORT + content
 
 
 def _patch_vite_config(content: str) -> str:
@@ -92,18 +83,19 @@ def _patch_vite_config(content: str) -> str:
     """
     if _VITE_PROFILING_ALIAS in content:
         return content
-    if _VITE_CONFIG_ANCHOR not in content:
+    match = _VITE_CONFIG_ANCHOR.search(content)
+    if match is None:
         msg = (
-            f"OtelPlugin cannot enable render_timing: {_VITE_CONFIG_ANCHOR!r} "
+            "OtelPlugin cannot enable render_timing: the resolve.alias block "
             f"was not found in {ReactRouter.VITE_CONFIG_FILE}."
         )
         raise RuntimeError(msg)
-    return content.replace(
-        _VITE_CONFIG_ANCHOR, _VITE_CONFIG_ANCHOR + _VITE_PROFILING_ALIAS, 1
-    )
+    return content[: match.end()] + _VITE_PROFILING_ALIAS + content[match.end() :]
 
 
-@dataclass
+# repr=False keeps Plugin.__repr__ (headers would print otherwise); eq=False
+# keeps instances hashable, like every other plugin.
+@dataclass(repr=False, eq=False)
 class OtelPlugin(Plugin):
     """Ship the reflex-otel browser module with the compiled frontend.
 
@@ -116,8 +108,10 @@ class OtelPlugin(Plugin):
     are compiled into the public bundle, so never put secrets there.
     """
 
-    # OTLP/HTTP traces URL; defaults follow OTEL_EXPORTER_OTLP_* env vars.
-    endpoint: str = field(default_factory=_default_endpoint)
+    # OTLP/HTTP traces URL the browser exports to. Deliberately no default and
+    # no OTEL_EXPORTER_OTLP_* fallback: those name the backend's collector,
+    # usually on a private network. Without it no exporter is installed.
+    endpoint: str | None = None
     # Resource service.name of the browser spans; defaults to "<app_name>-frontend".
     service_name: str | None = None
     # Extra HTTP headers sent by the browser exporter (public!).
@@ -168,6 +162,10 @@ class OtelPlugin(Plugin):
         Args:
             context: The pre-compile plugin context.
         """
+        if self.endpoint is None:
+            logger.warning(
+                "OtelPlugin: no endpoint configured; browser spans are not exported."
+            )
         context["add_modify_task"](Embed.ENTRY_PATH, _patch_entry_client)
         if self.render_timing:
             context["add_modify_task"](ReactRouter.VITE_CONFIG_FILE, _patch_vite_config)

@@ -1,8 +1,9 @@
 /**
  * Browser-side OpenTelemetry for Reflex apps, installed by reflex_otel.OtelPlugin.
  *
- * - Every event sent to the backend gets a CLIENT span and a W3C `traceparent`,
- *   so the backend event span joins the browser trace.
+ * - Every event and file upload sent to the backend is marked with a PRODUCER
+ *   span; sampled sends carry a W3C `traceparent`, so the backend event span
+ *   joins the browser trace.
  * - Web vitals (LCP, CLS, INP, FCP, TTFB) are reported as spans.
  * - React commits are reported as `react.render` spans via a root <Profiler>
  *   (opt-in; production builds need the react-dom profiling alias the plugin adds).
@@ -11,7 +12,13 @@
  * Configuration comes from `env.json` (`OTEL` key), written by the plugin.
  */
 import { createElement, Profiler } from "react";
-import { context, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
+import {
+  context,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+  TraceFlags,
+} from "@opentelemetry/api";
 import {
   setGlobalErrorHandler,
   W3CTraceContextPropagator,
@@ -19,6 +26,7 @@ import {
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import {
+  AlwaysOffSampler,
   BatchSpanProcessor,
   ParentBasedSampler,
   TraceIdRatioBasedSampler,
@@ -28,19 +36,30 @@ import { onCLS, onFCP, onINP, onLCP, onTTFB } from "web-vitals";
 import env from "$/env.json";
 
 const config = env.OTEL ?? {};
+// No endpoint, no exporter: nothing is sampled, so no traceparent is injected
+// either and the backend keeps tracing on its own.
+const exporting = Boolean(config.endpoint);
 
 const provider = new WebTracerProvider({
   resource: resourceFromAttributes({ "service.name": config.service_name }),
-  // Browser spans are trace roots: their sampled flag travels in `traceparent`
-  // and a parent-based backend sampler follows it, so sample here.
-  sampler: new ParentBasedSampler({
-    root: new TraceIdRatioBasedSampler(config.sample_rate ?? 1),
-  }),
-  spanProcessors: [
-    new BatchSpanProcessor(
-      new OTLPTraceExporter({ url: config.endpoint, headers: config.headers }),
-    ),
-  ],
+  // Browser spans are trace roots. Only a sampled span injects a `traceparent`
+  // (see onEventSend), so the backend inherits a positive decision and makes
+  // its own for everything else.
+  sampler: exporting
+    ? new ParentBasedSampler({
+        root: new TraceIdRatioBasedSampler(config.sample_rate ?? 1),
+      })
+    : new AlwaysOffSampler(),
+  spanProcessors: exporting
+    ? [
+        new BatchSpanProcessor(
+          new OTLPTraceExporter({
+            url: config.endpoint,
+            headers: config.headers,
+          }),
+        ),
+      ]
+    : [],
 });
 const tracer = provider.getTracer("reflex", config.version);
 
@@ -78,16 +97,29 @@ const epoch = (offset) => performance.timeOrigin + offset;
 
 let connectCount = 0;
 
+// Fire-and-forget to the backend: a PRODUCER span that marks the send. The
+// browser has no completion signal for an event, so it has no duration. An
+// unsampled span carries no traceparent: the backend then samples the event
+// as a root of its own instead of inheriting "not sampled".
+const markSend = (name, carrier) => {
+  const span = tracer.startSpan(name, {
+    kind: SpanKind.PRODUCER,
+    attributes: { "reflex.event.name": name },
+  });
+  if (span.spanContext().traceFlags & TraceFlags.SAMPLED) {
+    propagator.inject(trace.setSpan(context.active(), span), carrier, setter);
+  }
+  span.end();
+};
+
 window.__reflex_otel = {
   onEventSend(event) {
-    // Fire-and-forget over the socket: a PRODUCER span that marks the send. The
-    // browser has no completion signal for an event, so it has no duration.
-    const span = tracer.startSpan(event.name, {
-      kind: SpanKind.PRODUCER,
-      attributes: { "reflex.event.name": event.name },
-    });
-    propagator.inject(trace.setSpan(context.active(), span), event, setter);
-    span.end();
+    markSend(event.name, event);
+  },
+  onUploadSend(handler, headers) {
+    // The upload is an HTTP request: the traceparent travels as a header and
+    // the backend's request span, then the handler span, join the trace.
+    markSend(handler, headers);
   },
   onSocketConnect() {
     connectCount += 1;
@@ -108,7 +140,8 @@ window.__reflex_otel = {
     span.end();
     // Unload disconnects happen after the processor's own pagehide flush ran,
     // so the span would otherwise sit in the queue while the page tears down.
-    provider.forceFlush();
+    // Export failures are already reported by the global error handler.
+    provider.forceFlush().catch(() => {});
   },
 };
 

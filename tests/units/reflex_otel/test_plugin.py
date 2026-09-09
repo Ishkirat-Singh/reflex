@@ -15,14 +15,18 @@ from reflex_otel.plugin import (
 )
 
 
-def test_default_endpoint_follows_otel_env(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
-    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
-    assert OtelPlugin().endpoint == "http://localhost:4318/v1/traces"
+def test_endpoint_is_explicit(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """The browser endpoint never comes from the backend's OTEL_EXPORTER_OTLP_* variables."""
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318/")
-    assert OtelPlugin().endpoint == "http://collector:4318/v1/traces"
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://x/t")
-    assert OtelPlugin().endpoint == "https://x/t"
+    plugin = OtelPlugin()
+    assert plugin.endpoint is None
+    assert plugin.update_env_json()["OTEL"]["endpoint"] is None
+    with caplog.at_level("WARNING"):
+        _pre_compile_tasks(plugin)
+    assert "no endpoint" in caplog.text
     assert OtelPlugin(endpoint="http://y").endpoint == "http://y"
 
 
@@ -32,10 +36,17 @@ def test_frontend_dependencies_and_asset():
     ((path, source),) = plugin.get_static_assets()
     assert path == Path(BROWSER_MODULE)
     assert "window.__reflex_otel" in source
+    # Socket events and uploads both carry a traceparent.
+    assert "onEventSend(" in source
+    assert "onUploadSend(" in source
     # Export failures are forwarded through the frontend exception path.
     assert "setGlobalErrorHandler" in source
     assert "window.onerror(" in source
     assert "export const OtelRoot" in source
+    # Without an endpoint nothing is sampled, exported, or propagated.
+    assert "AlwaysOffSampler" in source
+    # Unsampled browser spans must not hand the backend a "not sampled" parent.
+    assert "TraceFlags.SAMPLED" in source
 
 
 def test_env_json_entry():
@@ -76,6 +87,12 @@ def test_pre_compile_patches_entry(caplog: pytest.LogCaptureFixture):
     assert patched.startswith('import { OtelRoot } from "$/utils/otel";\n')
     assert "createElement(OtelRoot, null, createElement(HydratedRouter))" in patched
     assert fn(patched) == patched
+    # The embed entry renders a second root into the host page.
+    embed = (
+        "createRoot(target).render(createElement(RouterProvider, { router }));\n"
+        "hydrateRoot(document, createElement(HydratedRouter));\n"
+    )
+    assert fn(embed).count("createElement(OtelRoot, null, ") == 2
     with caplog.at_level("WARNING"):
         assert _patch_entry_client("other();\n") == (
             'import { OtelRoot } from "$/utils/otel";\nother();\n'
@@ -101,8 +118,19 @@ def test_render_timing_aliases_react_dom_profiling():
         'find: "react-dom/client", replacement: "react-dom/profiling"' in resolve_block
     )
     assert fn(patched) == patched
+    # Whitespace changes in the template must not break the anchor.
+    reflowed = config.replace("resolve: {\n", "resolve:  {\n\n").replace(
+        "alias: [\n", "alias:\t[\n"
+    )
+    assert "react-dom/profiling" in fn(reflowed)
     with pytest.raises(RuntimeError, match="render_timing"):
         _patch_vite_config("export default {};\n")
+
+
+def test_plugin_repr_and_hash_hide_headers():
+    plugin = OtelPlugin(endpoint="http://c", headers={"authorization": "secret"})
+    assert "secret" not in repr(plugin)
+    assert hash(plugin) == hash(plugin)
 
 
 @pytest.mark.parametrize("rate", [-0.1, 1.5])

@@ -1,6 +1,9 @@
 """Tests for the reflex_otel instrumentor."""
 
+import subprocess
+import sys
 from collections.abc import Generator
+from importlib.metadata import entry_points
 
 import pytest
 from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
@@ -18,6 +21,28 @@ def instrumentor() -> Generator[ReflexInstrumentor, None, None]:
         inst.uninstrument()
 
 
+def test_plugin_import_does_not_load_the_instrumentor():
+    """rxconfig.py imports OtelPlugin in every CLI process; keep that cheap."""
+    code = (
+        "import sys; from reflex_otel import OtelPlugin; "
+        "print('opentelemetry.instrumentation.instrumentor' in sys.modules); "
+        "from reflex_otel import ReflexInstrumentor; print(ReflexInstrumentor.__name__)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    ).stdout.split()
+    assert out == ["False", "ReflexInstrumentor"]
+
+
+def test_entry_point_resolves_the_instrumentor():
+    (ep,) = [
+        e
+        for e in entry_points(group="opentelemetry_instrumentor")
+        if e.name == "reflex"
+    ]
+    assert ep.load() is ReflexInstrumentor
+
+
 def test_instrument_toggles_trace_points(instrumentor: ReflexInstrumentor):
     assert otel.enabled is False
     instrumentor.instrument(tracer_provider=TracerProvider())
@@ -32,9 +57,9 @@ def test_instrument_is_idempotent(instrumentor: ReflexInstrumentor):
     assert otel.enabled is True
 
 
-def test_dependencies_target_reflex_base(instrumentor: ReflexInstrumentor):
-    (dep,) = instrumentor.instrumentation_dependencies()
-    assert dep.startswith("reflex-base")
+def test_no_runtime_dependency_check(instrumentor: ReflexInstrumentor):
+    """reflex-base is a hard dependency: the resolver enforces the floor, not instrument()."""
+    assert instrumentor.instrumentation_dependencies() == ()
 
 
 def test_instrument_installs_asgi_middleware(instrumentor: ReflexInstrumentor):
